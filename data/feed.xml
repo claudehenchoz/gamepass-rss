@@ -1,12 +1,13 @@
 <?xml version='1.0' encoding='utf-8'?>
-<rss xmlns:media="http://search.yahoo.com/mrss/" version="2.0">
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:media="http://search.yahoo.com/mrss/" version="2.0">
   <channel>
     <title>New on Game Pass Ultimate (PC, CH)</title>
     <link>https://www.xbox.com/en-us/xbox-game-pass</link>
     <description>Games newly added to the Xbox Game Pass catalog.</description>
     <language>en-us</language>
-    <lastBuildDate>Thu, 19 Nov 2026 19:01:33 +0000</lastBuildDate>
+    <lastBuildDate>Thu, 19 Nov 2026 19:05:32 +0000</lastBuildDate>
     <generator>gamepass_rss.py</generator>
+    <atom:link href="https://raw.githubusercontent.com/claudehenchoz/gamepass-rss/main/data/feed.xml" rel="self" type="application/rss+xml" />
     <item>
       <title>PAW Patrol™: Dino World</title>
       <link>https://www.xbox.com/en-us/games/store/paw-patroltm-dino-world/9N3P3TRJGWV0</link>
