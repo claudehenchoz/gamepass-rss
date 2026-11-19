@@ -5,16 +5,16 @@ gamepass_rss.py — an RSS feed of *new additions* to the Xbox Game Pass catalog
 What it does, once per day:
   1. Fetches the product-ID list for one Game Pass tier + platform + market
      (a single request to catalog.gamepass.com).
-  2. Diffs it against a local SQLite database.
+  2. Diffs it against the state files in DATA_DIR (plain JSON, committed to git).
   3. Fetches full metadata *only* for product IDs it has never seen before
      (displaycatalog.mp.microsoft.com, batched).
   4. Writes feed.xml — one <item> per newly added game, newest first.
 
 Design rules (see also the "Why" notes throughout):
   * At most one successful catalog fetch per calendar day. Running the script
-    more often is safe and pointless; it simply re-renders the feed from the DB.
+    more often is safe and pointless; it simply re-renders the feed from stored state.
   * A failed fetch never touches the feed. Last-good state is kept.
-  * The first ever run seeds the database silently — otherwise you would get
+  * The first ever run seeds the state silently — otherwise you would get
     600 "new" games at once.
   * A product ID that merely replaces another listing of the same game
     (edition swap, re-published SKU) is NOT announced. Only a game whose title
@@ -26,38 +26,20 @@ Run:
     python3 gamepass_rss.py            # normal daily run
     python3 gamepass_rss.py --force    # ignore the once-a-day cap
     python3 gamepass_rss.py -v         # verbose logging
-    python3 gamepass_rss.py --render   # just rewrite feed.xml from the DB
+    python3 gamepass_rss.py --render   # just rewrite feed.xml from stored state
     python3 gamepass_rss.py --backfill 100   # re-announce the 100 newest games from the initial seed
     python3 gamepass_rss.py --dump 9PNJXVCVWD4K  # show stored raw store JSON for one product
 
-Suggested systemd timer (preferred over cron: Persistent=true replays a run
-the Pi slept through):
+Production runs as a GitHub Action (.github/workflows/update-feed.yml), daily
+at 03:00 UTC. It runs this script, then commits DATA_DIR back to the repo, so
+the feed is served from:
 
-    # /etc/systemd/system/gamepass-rss.service
-    [Unit]
-    Description=Game Pass additions RSS
-    [Service]
-    Type=oneshot
-    User=pi
-    ExecStart=/usr/bin/python3 /home/pi/gamepass_rss.py
-
-    # /etc/systemd/system/gamepass-rss.timer
-    [Unit]
-    Description=Run gamepass-rss daily
-    [Timer]
-    OnCalendar=*-*-* 07:00:00
-    RandomizedDelaySec=15m
-    Persistent=true
-    [Install]
-    WantedBy=timers.target
-
-    sudo systemctl enable --now gamepass-rss.timer
-
-Then serve DATA_DIR/feed.xml with anything static (nginx, Caddy, or even
-`python3 -m http.server` for LAN use).
+    https://raw.githubusercontent.com/<owner>/<repo>/main/data/feed.xml
 """
 
 from __future__ import annotations
+
+import os
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION — edit these.
@@ -68,13 +50,15 @@ PLATFORM = "pc"            # "pc" | "console"
 MARKET = "CH"              # ISO 3166-1 alpha-2 store market
 LANGUAGE = "en-us"         # Language of titles/descriptions in the feed
 
-# Where the database, feed and logs live. Default: a "data" folder next to
-# this script. Must be writable by the user running the script.
+# Where the state files and feed live. Default: a "data" folder next to this
+# script — which is what the GitHub workflow commits back to the repo.
 DATA_DIR = None            # e.g. "/var/lib/gamepass-rss"; None = <script dir>/data
 
 FEED_TITLE = f"New on Game Pass {TIER.title()} ({PLATFORM.upper()}, {MARKET})"
 FEED_DESCRIPTION = "Games newly added to the Xbox Game Pass catalog."
-FEED_SELF_URL = None       # Public URL of feed.xml, if you serve it (for <atom:link rel="self">)
+# Public URL of feed.xml, for <atom:link rel="self">. The GitHub workflow sets the
+# FEED_SELF_URL environment variable to the raw.githubusercontent.com URL.
+FEED_SELF_URL = os.environ.get("FEED_SELF_URL") or None
 FEED_MAX_ITEMS = 100       # Newest N additions kept in the feed
 
 # The list endpoint has no "added on" date, so on the very first run the script
@@ -103,14 +87,11 @@ RELISTING_WINDOW_DAYS = 30
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import argparse
-import gzip
 import json
 import logging
 import mimetypes
-import os
 import random
 import re
-import sqlite3
 import sys
 import time
 import unicodedata
@@ -296,13 +277,6 @@ class GameInfo:
     hero_url: str = ""
     screenshot_urls: list[str] = field(default_factory=list)
     store_url: str = ""
-
-    def to_json(self) -> str:
-        return json.dumps(self.__dict__, ensure_ascii=False)
-
-    @classmethod
-    def from_json(cls, text: str) -> "GameInfo":
-        return cls(**json.loads(text))
 
 
 def extract_game_info(product_id: str, product: dict) -> GameInfo:
@@ -516,137 +490,185 @@ def family_key(title: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Storage — SQLite
+# Storage — plain text files in DATA_DIR
 # ═══════════════════════════════════════════════════════════════════════════════
+#
+# Why text and not SQLite: the data directory is committed to git by the daily
+# GitHub Action. A binary database would be rewritten wholesale every day and
+# bloat the history; these files change by a handful of lines per run.
+#
+#   products.jsonl     one line per product ID, sorted — the diffable core state
+#   runs.jsonl         append-only audit log, one line per run
+#   catalog.json       latest raw SIGLS list response (git history is the audit trail)
+#   raw/<ID>.json      raw DisplayCatalog product, written once, never modified
+#
+# products.jsonl fields: product_id, title, family_key, first_seen (ISO UTC),
+# removed_at (ISO UTC or null; cleared if it returns), announced (bool),
+# suppressed_reason ('bootstrap' | 'relisting' | null), info (GameInfo).
+#
+# There is deliberately no per-product "last_seen": updating it would rewrite
+# every line every day. Presence is "removed_at is null"; see family_last_seen.
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS products (
-    product_id        TEXT PRIMARY KEY,
-    title             TEXT NOT NULL,
-    family_key        TEXT NOT NULL,
-    first_seen        TEXT NOT NULL,      -- ISO-8601 UTC, when we first saw it in the list
-    last_seen         TEXT NOT NULL,      -- ISO-8601 UTC, last run in which it was present
-    removed_at        TEXT,               -- set when it disappears; cleared if it returns
-    announced         INTEGER NOT NULL,   -- 1 = shown in the feed
-    suppressed_reason TEXT,               -- 'bootstrap' | 'relisting' | NULL
-    info_json         TEXT NOT NULL,      -- GameInfo as JSON (what the feed renders)
-    raw_product_gz    BLOB                -- gzip'd raw DisplayCatalog product, for future re-rendering
-);
-CREATE INDEX IF NOT EXISTS products_family_idx ON products(family_key);
-CREATE INDEX IF NOT EXISTS products_first_seen_idx ON products(first_seen);
-
-CREATE TABLE IF NOT EXISTS runs (
-    id            INTEGER PRIMARY KEY,
-    started_at    TEXT NOT NULL,          -- ISO-8601 UTC
-    status        TEXT NOT NULL,          -- 'ok' | 'failed'
-    product_count INTEGER,
-    added         INTEGER,
-    announced     INTEGER,
-    removed       INTEGER,
-    error         TEXT,
-    raw_sigls_gz  BLOB                    -- gzip'd raw list response, for audit / re-diffing
-);
-CREATE INDEX IF NOT EXISTS runs_started_idx ON runs(started_at);
-"""
+PRODUCTS_FILE = "products.jsonl"
+RUNS_FILE = "runs.jsonl"
+CATALOG_FILE = "catalog.json"
+RAW_DIR = "raw"
 
 
 class Store:
-    """Thin, explicit wrapper around the SQLite database. No ORM, no magic."""
+    """In-memory state loaded from DATA_DIR; nothing touches disk until commit()."""
 
-    def __init__(self, path: Path):
-        self.conn = sqlite3.connect(path)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.executescript(SCHEMA)
+    def __init__(self, data_dir: Path):
+        self.data_dir = data_dir
+        self._load()
+
+    def _load(self) -> None:
+        self.products: dict[str, dict] = {
+            record["product_id"]: record for record in _read_jsonl(self.data_dir / PRODUCTS_FILE)
+        }
+        self.runs: list[dict] = _read_jsonl(self.data_dir / RUNS_FILE)
+        self._pending_raw: dict[str, dict] = {}
+        self._pending_listing: Optional[bytes] = None
 
     # ── runs ──────────────────────────────────────────────────────────────────
 
-    def last_run(self, status: str) -> Optional[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT * FROM runs WHERE status = ? ORDER BY started_at DESC LIMIT 1", (status,)
-        ).fetchone()
+    def last_run(self, status: str) -> Optional[dict]:
+        matching = [run for run in self.runs if run["status"] == status]
+        return max(matching, key=lambda run: run["started_at"]) if matching else None
 
     def successful_runs_on(self, local_date: str) -> int:
-        # started_at is UTC; compare on the local date by checking each row in Python.
-        rows = self.conn.execute("SELECT started_at FROM runs WHERE status = 'ok'").fetchall()
-        return sum(1 for row in rows if _to_local_date(row["started_at"]) == local_date)
+        # started_at is UTC; "per day" is evaluated in the local timezone.
+        return sum(1 for run in self.runs if run["status"] == "ok" and _to_local_date(run["started_at"]) == local_date)
 
-    def record_run(self, started_at: datetime, status: str, **fields: Any) -> None:
-        columns = ["started_at", "status", *fields]
-        values = [started_at.isoformat(), status, *fields.values()]
-        placeholders = ", ".join("?" for _ in columns)
-        self.conn.execute(f"INSERT INTO runs ({', '.join(columns)}) VALUES ({placeholders})", values)
+    def record_run(self, started_at: datetime, status: str, raw_listing: Optional[bytes] = None,
+                   **fields: Any) -> None:
+        run = {"started_at": started_at.isoformat(), "status": status, "product_count": None, "added": None,
+               "announced": None, "removed": None, "error": None}
+        run.update(fields)
+        self.runs.append(run)
+        if raw_listing is not None:
+            self._pending_listing = raw_listing
 
     # ── products ──────────────────────────────────────────────────────────────
 
     def known_product_ids(self) -> set[str]:
-        return {row["product_id"] for row in self.conn.execute("SELECT product_id FROM products")}
+        return set(self.products)
 
     def is_empty(self) -> bool:
-        return self.conn.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0
+        return not self.products
 
-    def family_last_seen(self, key: str) -> Optional[datetime]:
-        row = self.conn.execute("SELECT MAX(last_seen) AS ts FROM products WHERE family_key = ?", (key,)).fetchone()
-        return datetime.fromisoformat(row["ts"]) if row and row["ts"] else None
+    def family_last_seen(self, key: str, now: datetime) -> Optional[datetime]:
+        """When was a product of this title family last in the catalog?
+
+        A member that is still listed counts as seen *now* (sync_catalog marks
+        presence before deciding announcements). Otherwise the latest removed_at
+        stands in for the old last_seen — at most one run later than the true
+        last sighting, which is noise against RELISTING_WINDOW_DAYS.
+        """
+        members = [record for record in self.products.values() if record["family_key"] == key]
+        if not members:
+            return None
+        if any(record["removed_at"] is None for record in members):
+            return now
+        return max(datetime.fromisoformat(record["removed_at"]) for record in members)
 
     def insert_product(self, info: GameInfo, raw_product: Optional[dict], seen_at: datetime,
                        announced: bool, suppressed_reason: Optional[str]) -> None:
-        self.conn.execute(
-            """INSERT INTO products (product_id, title, family_key, first_seen, last_seen, removed_at,
-                                     announced, suppressed_reason, info_json, raw_product_gz)
-               VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)""",
-            (info.product_id, info.title, family_key(info.title), seen_at.isoformat(), seen_at.isoformat(),
-             int(announced), suppressed_reason, info.to_json(),
-             gzip.compress(json.dumps(raw_product, separators=(",", ":")).encode()) if raw_product else None),
-        )
+        self.products[info.product_id] = {
+            "product_id": info.product_id,
+            "title": info.title,
+            "family_key": family_key(info.title),
+            "first_seen": seen_at.isoformat(),
+            "removed_at": None,
+            "announced": announced,
+            "suppressed_reason": suppressed_reason,
+            "info": info.__dict__.copy(),
+        }
+        if raw_product:
+            self._pending_raw[info.product_id] = raw_product
 
     def mark_present(self, product_ids: Iterable[str], seen_at: datetime) -> None:
-        self.conn.executemany(
-            "UPDATE products SET last_seen = ?, removed_at = NULL WHERE product_id = ?",
-            [(seen_at.isoformat(), pid) for pid in product_ids],
-        )
+        for product_id in product_ids:
+            self.products[product_id]["removed_at"] = None
 
     def mark_removed(self, product_ids: Iterable[str], seen_at: datetime) -> int:
-        cursor = self.conn.executemany(
-            "UPDATE products SET removed_at = ? WHERE product_id = ? AND removed_at IS NULL",
-            [(seen_at.isoformat(), pid) for pid in product_ids],
-        )
-        return cursor.rowcount
+        count = 0
+        for product_id in product_ids:
+            record = self.products[product_id]
+            if record["removed_at"] is None:
+                record["removed_at"] = seen_at.isoformat()
+                count += 1
+        return count
 
     def announced_products(self, limit: int) -> list[tuple[GameInfo, datetime]]:
-        rows = self.conn.execute(
-            "SELECT info_json, first_seen FROM products WHERE announced = 1 ORDER BY first_seen DESC, title LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [(GameInfo.from_json(row["info_json"]), datetime.fromisoformat(row["first_seen"])) for row in rows]
+        records = sorted((r for r in self.products.values() if r["announced"]), key=lambda r: r["title"])
+        records.sort(key=lambda r: r["first_seen"], reverse=True)     # Stable: newest first, then by title
+        return [(GameInfo(**r["info"]), datetime.fromisoformat(r["first_seen"])) for r in records[:limit]]
 
     def bootstrap_products(self) -> list[tuple[str, str, Optional[dict]]]:
         """(product_id, title, raw product or None) for every row seeded at bootstrap."""
-        rows = self.conn.execute(
-            "SELECT product_id, title, raw_product_gz FROM products WHERE suppressed_reason = 'bootstrap'"
-        ).fetchall()
         return [
-            (row["product_id"], row["title"],
-             json.loads(gzip.decompress(row["raw_product_gz"])) if row["raw_product_gz"] else None)
-            for row in rows
+            (record["product_id"], record["title"], self.raw_product(record["product_id"]))
+            for record in self.products.values() if record["suppressed_reason"] == "bootstrap"
         ]
 
     def raw_product(self, product_id: str) -> Optional[dict]:
-        row = self.conn.execute("SELECT raw_product_gz FROM products WHERE product_id = ?", (product_id.upper(),)).fetchone()
-        return json.loads(gzip.decompress(row["raw_product_gz"])) if row and row["raw_product_gz"] else None
+        product_id = product_id.upper()
+        if product_id in self._pending_raw:
+            return self._pending_raw[product_id]
+        path = self.data_dir / RAW_DIR / f"{product_id}.json"
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 
     def set_first_seen(self, product_id: str, first_seen: datetime) -> None:
-        self.conn.execute("UPDATE products SET first_seen = ? WHERE product_id = ?", (first_seen.isoformat(), product_id))
+        self.products[product_id]["first_seen"] = first_seen.isoformat()
 
     def set_announced(self, product_ids: Iterable[str], announced: bool) -> None:
-        self.conn.executemany(
-            "UPDATE products SET announced = ? WHERE product_id = ?", [(int(announced), pid) for pid in product_ids]
-        )
+        for product_id in product_ids:
+            self.products[product_id]["announced"] = announced
+
+    # ── persistence ───────────────────────────────────────────────────────────
 
     def commit(self) -> None:
-        self.conn.commit()
+        # Raw files first: products.jsonl must never reference a product whose
+        # raw file failed to write.
+        raw_dir = self.data_dir / RAW_DIR
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        for product_id, raw in self._pending_raw.items():
+            _write_atomic(raw_dir / f"{product_id}.json", _dumps(raw) + "\n")
+        if self._pending_listing is not None:
+            # Indented so each product ID sits on its own line: the git diff of
+            # this file is then exactly the day's additions and removals.
+            listing = json.loads(self._pending_listing)
+            _write_atomic(self.data_dir / CATALOG_FILE, json.dumps(listing, ensure_ascii=False, indent=1) + "\n")
+        _write_atomic(self.data_dir / PRODUCTS_FILE,
+                      "".join(_dumps(self.products[pid]) + "\n" for pid in sorted(self.products)))
+        _write_atomic(self.data_dir / RUNS_FILE, "".join(_dumps(run) + "\n" for run in self.runs))
+        self._pending_raw.clear()
+        self._pending_listing = None
+
+    def rollback(self) -> None:
+        """Discard everything since the last commit by reloading from disk."""
+        self._load()
 
     def close(self) -> None:
-        self.conn.close()
+        pass
+
+
+def _dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    with path.open(encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)                       # Atomic: a reader never sees a half-written file
 
 
 def _to_local_date(iso_utc: str) -> str:
@@ -714,7 +736,7 @@ def sync_catalog(store: Store, now: datetime) -> SyncResult:
 
     products = fetch_products(new_ids) if new_ids else {}
 
-    # Update presence first, so relisting detection below sees accurate last_seen
+    # Update presence first, so relisting detection below sees accurate presence
     # for everything *except* the newcomers we're about to insert.
     store.mark_present(current & known, now)
     removed = store.mark_removed(gone_ids, now)
@@ -736,7 +758,7 @@ def sync_catalog(store: Store, now: datetime) -> SyncResult:
         log.info("%-12s %s%s", "NEW" if announced else "SUPPRESSED", info.title, f"  [{reason}]" if reason else "")
 
     store.record_run(now, "ok", product_count=len(current), added=len(new_ids), announced=announced_count,
-                     removed=removed, raw_sigls_gz=gzip.compress(listing.raw_json))
+                     removed=removed, raw_listing=listing.raw_json)
     if is_bootstrap and BOOTSTRAP_ANNOUNCE > 0:
         announced_count = backfill_bootstrap(store, BOOTSTRAP_ANNOUNCE)
     store.commit()
@@ -786,7 +808,7 @@ def decide_announcement(store: Store, info: GameInfo, now: datetime, is_bootstra
     """
     if is_bootstrap:
         return False, "bootstrap"
-    seen = store.family_last_seen(family_key(info.title))
+    seen = store.family_last_seen(family_key(info.title), now)
     if seen and now - seen < timedelta(days=RELISTING_WINDOW_DAYS):
         return False, "relisting"
     return True, None
@@ -900,7 +922,7 @@ def write_feed(store: Store, feed_path: Path, now: datetime) -> int:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--force", action="store_true", help="fetch even if already fetched today")
-    parser.add_argument("--render", action="store_true", help="only rewrite feed.xml from the database; no network")
+    parser.add_argument("--render", action="store_true", help="only rewrite feed.xml from the stored state; no network")
     parser.add_argument("--backfill", type=int, metavar="N", nargs="?", const=BOOTSTRAP_ANNOUNCE,
                         help="(re)announce the N newest bootstrap-seeded games using inferred added dates; no network")
     parser.add_argument("--dump", metavar="PRODUCT_ID", help="print the stored raw store JSON for one product and exit")
@@ -921,10 +943,10 @@ def main(argv: list[str]) -> int:
 
     data_dir = Path(DATA_DIR) if DATA_DIR else Path(__file__).resolve().parent / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
-    db_path, feed_path = data_dir / "gamepass.sqlite3", data_dir / "feed.xml"
+    feed_path = data_dir / "feed.xml"
 
     now = datetime.now(timezone.utc)
-    store = Store(db_path)
+    store = Store(data_dir)
     exit_code = 0
     try:
         if args.dump:
@@ -945,7 +967,7 @@ def main(argv: list[str]) -> int:
                 log.info("Not fetching: %s", why)
             except FetchError as error:
                 # Nothing has been committed; last-good state is intact.
-                store.conn.rollback()
+                store.rollback()
                 store.record_run(now, "failed", error=str(error))
                 store.commit()
                 log.error("Fetch failed, feed left unchanged: %s", error)

@@ -1,0 +1,50 @@
+name: Update feed
+
+on:
+  schedule:
+    - cron: "0 3 * * *"          # 03:00 UTC daily (GitHub may start it some minutes late)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Fetch even if already fetched today (--force)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write                # Commit data/ back to the repo
+
+concurrency:
+  group: gamepass-rss            # Never let two runs race on data/
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner's preinstalled python3 is enough: the script is stdlib-only.
+      - name: Run gamepass_rss.py
+        id: run
+        env:
+          TZ: UTC                # "Once per day" is evaluated in this timezone
+          FEED_SELF_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/data/feed.xml
+          FORCE: ${{ inputs.force && '--force' || '' }}
+        run: python3 gamepass_rss.py $FORCE
+
+      # Runs even if the fetch failed, so the 'failed' line in runs.jsonl is kept
+      # (the job still ends red, which triggers GitHub's failure email).
+      - name: Commit updated data
+        if: always() && steps.run.outcome != 'skipped'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then
+            echo "Nothing changed."
+            exit 0
+          fi
+          git commit -m "Update feed $(date -u +%Y-%m-%d)"
+          git pull --rebase
+          git push

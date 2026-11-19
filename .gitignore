@@ -1,0 +1,5 @@
+# Temp files from atomic writes
+*.tmp
+# Legacy SQLite state from before the move to text files
+data/gamepass.sqlite3
+__pycache__/
