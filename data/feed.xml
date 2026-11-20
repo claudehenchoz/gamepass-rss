@@ -5,7 +5,7 @@
     <link>https://www.xbox.com/en-us/xbox-game-pass</link>
     <description>Games newly added to the Xbox Game Pass catalog.</description>
     <language>en-us</language>
-    <lastBuildDate>Thu, 19 Nov 2026 19:05:32 +0000</lastBuildDate>
+    <lastBuildDate>Fri, 20 Nov 2026 10:56:12 +0000</lastBuildDate>
     <generator>gamepass_rss.py</generator>
     <atom:link href="https://raw.githubusercontent.com/claudehenchoz/gamepass-rss/main/data/feed.xml" rel="self" type="application/rss+xml" />
     <item>
